@@ -1,0 +1,9 @@
+{
+  "name": "dsh-codex-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local message bridge for the DeepSeek Harness desktop application",
+  "scripts": { "check": "node --check index.js" },
+  "engines": { "node": ">=24" }
+}
