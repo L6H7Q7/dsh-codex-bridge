@@ -1,3 +1,4 @@
+// 2026-10-12: all-group access; new sessions still default to Codex-DeepSeek.
 /**
  * dsh-codex-bridge —— 仅 loopback、无认证的本地 HTTP 入口。
  *
@@ -50,6 +51,7 @@ const SETTLED_LIMIT = 2048;
 const EVENT_TEXT_CHARS = 16 * 1024;
 const MESSAGE_FIELDS = ['sessionId', 'text', 'requestId', 'clientTimeZone', 'mode'];
 const CREATE_FIELDS = ['sessionId'];
+export const ACCESS_SCOPE = 'all-sessions';
 
 function errorText(error) {
   if (error === undefined || error === null) return 'unknown error';
@@ -493,12 +495,14 @@ export function createRuntime(deps) {
     return projectPromise;
   }
 
-  async function assertSessionInProject(sessionId) {
-    const workspace = await project();
-    if (!workspace.sessionIds.includes(sessionId)) {
-      throw httpError(403, 'session does not belong to the Codex-DeepSeek project');
+  // Query the official live/persisted corpus; no workspace reassignment or resume.
+  async function assertSessionAccessible(sessionId) {
+    assertLive();
+    const records = await query.listSessions();
+    assertLive();
+    if (!records.some((record) => record.header.id === sessionId)) {
+      throw httpError(404, 'session not found');
     }
-    return workspace;
   }
 
   const inFlight = new Map();
@@ -539,9 +543,25 @@ export function createRuntime(deps) {
 
   async function listSessions() {
     assertLive();
-    const workspace = await project();
+    const records = await query.listSessions();
     assertLive();
-    return { workspaceId: workspace.id, cwd: workspace.path, sessionIds: [...workspace.sessionIds] };
+    const workspaces = registry.list().map((workspace) => ({
+      workspaceId: workspace.id, title: workspace.title, cwd: workspace.path,
+      sessionIds: [...workspace.sessionIds],
+    }));
+    const ownerBySession = new Map(workspaces.flatMap((workspace) =>
+      workspace.sessionIds.map((id) => [id, workspace.workspaceId])));
+    const defaultWorkspace = workspaces.find((workspace) => workspace.cwd.toLowerCase() === PROJECT_DIR.toLowerCase());
+    return {
+      scope: ACCESS_SCOPE,
+      workspaceId: defaultWorkspace?.workspaceId ?? null, cwd: PROJECT_DIR,
+      sessionIds: records.map((record) => record.header.id),
+      workspaces,
+      sessions: records.map((record) => ({
+        sessionId: record.header.id, cwd: record.header.cwd ?? null,
+        workspaceId: ownerBySession.get(record.header.id) ?? null,
+      })),
+    };
   }
 
   async function createSession(body, signal) {
@@ -558,13 +578,13 @@ export function createRuntime(deps) {
 
   async function sendMessage(body, signal) {
     const parsed = validateMessage(body);
-    // 归属校验必须早于任何去重查询：否则跨会话复用同一 requestId 时，
-    // 会先被签名冲突挡成 409，永远走不到「不属于本项目」这个更准确的回答。
-    await assertSessionInProject(parsed.sessionId);
+    // 会话存在性检查早于去重查询，确保未知会话返回404，
+    // 而不是被复用 requestId 的签名冲突挡成409。
+    await assertSessionAccessible(parsed.sessionId);
     const claim = claimMessage(parsed.requestId, parsed.signature, async () => {
       assertLive();
       assertSignal(signal);
-      await assertSessionInProject(parsed.sessionId);                    // 投递前再确认一次
+      await assertSessionAccessible(parsed.sessionId);                    // 投递前再确认一次
       assertLive();
       assertSignal(signal);
       const request = { sessionId: parsed.sessionId, requestId: parsed.requestId, mode: 'queue', content: parsed.content };
@@ -580,7 +600,7 @@ export function createRuntime(deps) {
     const sessionId = url.searchParams.get('sessionId');
     if (typeof sessionId !== 'string' || sessionId.length === 0) throw httpError(400, 'sessionId is required');
     const requestId = url.searchParams.get('requestId') ?? undefined;
-    await assertSessionInProject(sessionId);
+    await assertSessionAccessible(sessionId);
 
     const observation = await query.readSession(sessionId);
     const events = observation.events;
@@ -635,7 +655,7 @@ export function createRuntime(deps) {
     const rawSince = url.searchParams.get('sinceSeq');
     const sinceSeq = rawSince === null ? -1 : Number(rawSince);
     if (!Number.isSafeInteger(sinceSeq) || sinceSeq < -1) throw httpError(400, 'sinceSeq must be an integer >= -1');
-    await assertSessionInProject(sessionId);
+    await assertSessionAccessible(sessionId);
 
     const observation = await query.readSession(sessionId);
     const rows = [];
@@ -652,6 +672,7 @@ export function createRuntime(deps) {
     const workspace = await project();
     return {
       ready: !disposed,
+      scope: ACCESS_SCOPE,
       route: ROUTE_PREFIX,
       project: { cwd: workspace.path, sessionCount: workspace.sessionIds.length },
       timeoutMs: REQUEST_TIMEOUT_MS,

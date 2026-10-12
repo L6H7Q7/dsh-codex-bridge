@@ -7,14 +7,14 @@
 ## 功能
 
 - 启用时自动创建、注册 Codex-DeepSeek 专用项目，目录已存在则复用。
-- 在该项目中新建会话，或向已有会话投递文本。
+- 默认在 Codex-DeepSeek 项目中新建会话；可列出、读取和向所有分组及未归组的已有会话投递文本。
 - queue 模式排队发送，不主动中断当前回合。
 - 查询请求对应回合及审批状态，读取消息正文。
 - 同一插件生命周期内并发去重和内容冲突检测。
 - 仅接受 loopback 服务、合法 Host 和同源 Origin，拒绝跨站请求。
 - 停用入口后保留项目和会话数据。
 
-**安全边界：接口没有认证，其他本机进程也可调用，发送的任务可能触发模型费用及 Agent 工具操作。项目归属检查不等于文件系统隔离，实际权限取决于 Harness preset 与审批设置。不要用代理、端口转发或隧道把它暴露到网络。**
+**安全边界：接口没有认证，其他本机进程也可调用，发送的任务可能触发模型费用及 Agent 工具操作。桥接访问范围不等于文件系统隔离，实际权限取决于 Harness preset 与审批设置。不要用代理、端口转发或隧道把它暴露到网络。**
 
 ## 下载与部署
 
@@ -92,7 +92,7 @@ $result.events | Where-Object type -eq 'assistant/message' | Select-Object seq,t
 | 方法 | 路径 | 用途 |
 |---|---|---|
 | GET | `/v1/health` | 插件和项目就绪状态 |
-| GET | `/v1/sessions` | 列出专用项目的会话ID |
+| GET | `/v1/sessions` | 列出完整会话ID、分组元数据及会话归属 |
 | POST | `/v1/sessions` | 新建或安全接管会话，body 为可选 sessionId |
 | POST | `/v1/messages` | 文本投递：sessionId、text、可选 requestId/clientTimeZone，mode 只允许 queue |
 | GET | `/v1/status?sessionId=…&requestId=…` | 查询请求与回合状态 |
@@ -102,7 +102,7 @@ $result.events | Where-Object type -eq 'assistant/message' | Select-Object seq,t
 
 ## 限制与重试
 
-- 只操作专用项目，不支持附件、steer 或回合取消。
+- 读取、状态查询及消息发送覆盖所有分组与未归组会话；创建会话仍默认使用 Codex-DeepSeek。不支持附件、steer 或回合取消。
 - POST body 上限 256 KiB，文本上限 64 Ki 字符；事件正文最多回传 16 Ki 字符，超出会标记截断。
 - 服务约 30 秒处理超时。504 或连接断开后的受理结果可能未知，应查询状态，或复用原 ID 与完整内容重试；不要盲目换新 ID。
 - 新建会话时客户端应先生成稳定的 sessionId，重试复用；不带 ID 每次创建新会话。
@@ -115,8 +115,26 @@ $result.events | Where-Object type -eq 'assistant/message' | Select-Object seq,t
 
 更新前先停用挂载，再替换两个插件文件，重新挂载并检查健康状态。默认 HMR 不监听插件源码文件，不能保证只替换 JS 就自动生效。
 
+## 全部分组访问
+
+GET `/v1/sessions` 使用官方 `sessionQuery.listSessions()` 列出 live/persisted 完整会话语料，包括所有分组与未归组会话。返回字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `scope` | 固定为 `all-sessions`；健康接口也返回此字段 |
+| `sessionIds` | 完整会话 ID 列表 |
+| `workspaces` | 分组元数据：`workspaceId`、`title`、`cwd`、`sessionIds` |
+| `sessions` | 会话元数据：`sessionId`、`cwd`、`workspaceId`；未归组会话的 `workspaceId` 为 null |
+| 顶层 `workspaceId` / `cwd` | 默认创建项目的信息，不表示会话列表的范围 |
+
+`/v1/events`、`/v1/status` 和 `/v1/messages` 接受完整语料中的已有会话；未知会话返回404。访问不会移动会话、改写分组或绕过官方 resume、写锁、preset 与审批。新建会话仍默认使用 Codex-DeepSeek。
+
 ## 已验证与待验证
 
-已实测：热加载、自动注册项目、默认 standard preset、新建独立会话、文本发送及模型正常回复、同 ID 去重、冲突409、跨项目403、Host/Origin403、Content-Type415、实际超限413、官方 API 认证保持、撤回后404。没有安装第三方依赖。
+原版已实测：热加载、自动注册项目、默认 standard preset、新建会话、文本发送及模型回复、同 ID 去重、冲突409、Host/Origin403、Content-Type415、超限413、官方 API 认证保持及停用后404。原版跨项目403限制已由全分组访问取代。
 
-源码审阅和内存验证不替代其他版本的兼容性测试；长会话性能、跨重启完整去重和不同平台尚未保证。仓库只包含本插件及说明，不包含 Harness 原程序、凭据或聊天记录。
+2026-10-12 全分组版本已通过语法检查及内存模拟：完整会话列表、跨组与未归组读取、模拟发送、未知会话404及 disposed 状态拒绝。重启 Harness 后，健康接口返回 `scope: all-sessions`，实际跨分组与未归组的事件读取、状态查询通过抽样验证。新版跨分组发送仅通过模拟检查，未发送真实测试消息。
+
+更新时，原路径卸载再挂载仍可能复用旧模块。此次验证中，仅重新挂载未加载新版，重启 Harness 后新版生效；更新后应检查 `/v1/health` 的 `scope` 字段及实际接口行为。
+
+没有安装第三方依赖。源码审阅和内存验证不替代其他版本的兼容性测试；长会话性能、跨重启完整去重和不同平台尚未保证。仓库只包含插件及说明，不包含 Harness 原程序、凭据或聊天记录。
